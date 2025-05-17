@@ -1,0 +1,156 @@
+name: 'Terraform Deployment Pipeline'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  checkout:
+    name: 'Checkout Code'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Cache Terraform
+        uses: actions/cache@v3
+        with:
+          path: .terraform
+          key: ${{ runner.os }}-terraform-${{ hashFiles('**/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-
+
+      - name: Upload Terraform Directory
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-code
+          path: terraform/
+          retention-days: 1
+
+  terraform_plan:
+    name: 'Terraform Plan'
+    needs: checkout
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - name: Download Terraform Directory
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-code
+          path: terraform
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Format
+        working-directory: ./terraform
+        run: terraform fmt -check
+
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        working-directory: ./terraform
+        run: terraform plan -no-color -out=tfplan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      - name: Upload Terraform Plan
+        uses: actions/upload-artifact@v3
+        with:
+          name: terraform-plan
+          path: terraform/tfplan
+          retention-days: 1
+          
+      - name: Create Plan Summary
+        working-directory: ./terraform
+        run: |
+          echo "## Terraform Plan Output" > plan_summary.md
+          echo '```terraform' >> plan_summary.md
+          terraform show -no-color tfplan >> plan_summary.md
+          echo '```' >> plan_summary.md
+          
+      - name: Add Plan Comment
+        uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const planSummary = fs.readFileSync('terraform/plan_summary.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: planSummary
+            })
+
+  terraform_apply:
+    name: 'Terraform Apply'
+    needs: terraform_plan
+    runs-on: ubuntu-latest
+    environment: production
+    
+    # This environment should have required reviewers configured
+    # to implement the approval step before deployment
+    
+    steps:
+      - name: Download Terraform Directory
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-code
+          path: terraform
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v3
+        with:
+          name: terraform-plan
+          path: terraform
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ./terraform
+        run: terraform apply -auto-approve tfplan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
